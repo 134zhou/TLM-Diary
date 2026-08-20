@@ -1,0 +1,8 @@
+{
+  "item.tlm_diary.diary_book": "日记本",
+  "tool.tlm_diary.write_diary_entry.summary": "正在写日记……",
+  "tlm_diary.diary.empty": "这本日记还没有内容。",
+  "tlm_diary.tooltip.bound_to": "%s 的日记本",
+  "tlm_diary.tooltip.unbound": "未绑定女仆",
+  "tlm_diary.tooltip.unknown": "未知女仆"
+}

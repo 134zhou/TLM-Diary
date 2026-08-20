@@ -1,0 +1,83 @@
+package com.tlm.diary;
+
+import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResultHolder;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.AABB;
+import net.neoforged.neoforge.network.PacketDistributor;
+
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * 日记本物品。
+ * <p>
+ * 不可堆叠、不可复制（防止同一 uuid 出现在多本日记上）；玩家右键为只读阅读，
+ * 写入仅由女仆 AI 经 {@link WriteDiaryEntryTool}（服务端）触发。
+ */
+public class DiaryBookItem extends Item {
+
+    public DiaryBookItem() {
+        super(new Properties().stacksTo(1));
+    }
+
+    @Override
+    public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
+        ItemStack stack = player.getItemInHand(hand);
+        // 服务端：读外部文件，把条目下发到客户端，客户端据此打开只读 BookViewScreen。
+        // 玩家无任何编辑入口；正文仅存在于 payload 内存中，客户端 ItemStack 上不含正文。
+        if (!level.isClientSide() && player instanceof ServerPlayer serverPlayer) {
+            // 事件驱动刷新 ownerName 回退缓存（女仆同维度已加载时）
+            DiaryApi.refreshOwnerName(stack, level);
+            DiaryMeta meta = DiaryApi.metaOf(stack);
+            List<DiaryEntry> entries = DiaryApi.readEntries(stack);
+            PacketDistributor.sendToPlayer(serverPlayer, new DiaryViewPayload(meta.diaryUuid(), entries));
+        }
+        return InteractionResultHolder.sidedSuccess(stack, level.isClientSide());
+    }
+
+    @Override
+    public void appendHoverText(ItemStack stack, TooltipContext context, List<Component> tooltipComponents, TooltipFlag tooltipFlag) {
+        // 客户端：绑定后显示女仆当前名称。优先按 ownerUuid 实时查询实体（命名牌改名立即生效，零轮询）；
+        // 女仆不在客户端视野时回退显示缓存的 ownerName。
+        DiaryMeta meta = stack.get(DiaryMod.DIARY_META.get());
+        if (meta == null || !meta.isBound()) {
+            tooltipComponents.add(Component.translatable("tlm_diary.tooltip.unbound").withStyle(ChatFormatting.GRAY));
+        } else {
+            String name = resolveOwnerName(meta.ownerUuid().get(), meta.ownerName());
+            tooltipComponents.add(Component.translatable("tlm_diary.tooltip.bound_to", name).withStyle(ChatFormatting.GRAY));
+        }
+        super.appendHoverText(stack, context, tooltipComponents, tooltipFlag);
+    }
+
+    /** 实时查询女仆当前名称；查询失败回退缓存；缓存也为空则用占位文案。 */
+    private static String resolveOwnerName(UUID ownerUuid, String cached) {
+        Level level = Minecraft.getInstance().level;
+        if (level != null) {
+            List<EntityMaid> maids = level.getEntitiesOfClass(EntityMaid.class, AABB.INFINITE,
+                    m -> m.getUUID().equals(ownerUuid));
+            if (!maids.isEmpty()) {
+                return maids.get(0).getName().getString();
+            }
+        }
+        if (cached != null && !cached.isBlank()) {
+            return cached;
+        }
+        return Component.translatable("tlm_diary.tooltip.unknown").getString();
+    }
+
+    @Override
+    public void verifyComponentsAfterLoad(ItemStack stack) {
+        // 物品从磁盘/网络反序列化后，把其 uuid 登记为"活跃日记"，供销毁检测（孤儿标记）使用。
+        DiaryApi.markAlive(stack);
+    }
+}

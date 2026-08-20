@@ -1,0 +1,8 @@
+{
+  "item.tlm_diary.diary_book": "Diary Book",
+  "tool.tlm_diary.write_diary_entry.summary": "writing in the diary...",
+  "tlm_diary.diary.empty": "This diary is empty.",
+  "tlm_diary.tooltip.bound_to": "%s's Diary",
+  "tlm_diary.tooltip.unbound": "Not bound to a maid",
+  "tlm_diary.tooltip.unknown": "Unknown Maid"
+}
