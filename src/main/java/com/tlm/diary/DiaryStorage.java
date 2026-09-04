@@ -120,6 +120,53 @@ public final class DiaryStorage {
         }
     }
 
+    /** 正向销毁证据：把文件标记为孤儿并保存；文件不存在或已标记则忽略。 */
+    public static void markOrphaned(UUID diaryUuid) {
+        DiaryFile file = load(diaryUuid);
+        if (file == null || file.orphaned) {
+            return;
+        }
+        file.orphaned = true;
+        file.updatedAt = System.currentTimeMillis();
+        save(diaryUuid, file);
+    }
+
+    /** 删除某本日记的文件（仅用于清理"恢复后遗弃的空文件"）。 */
+    public static void deleteIfEmpty(UUID diaryUuid) {
+        DiaryFile file = load(diaryUuid);
+        if (file != null && !file.orphaned && file.entries.isEmpty()) {
+            try {
+                Files.deleteIfExists(file(diaryUuid));
+            } catch (IOException e) {
+                DiaryMod.LOGGER.error("Failed to delete empty diary file {}", file(diaryUuid), e);
+            }
+        }
+    }
+
+    /** 列出某女仆名下已标记孤儿（正向销毁证据）的日记文件，按 updatedAt 倒序。 */
+    public static List<Path> listOwnedOrphaned(UUID ownerUuid) {
+        Path dir = diariesDir();
+        if (!Files.isDirectory(dir)) {
+            return List.of();
+        }
+        try (Stream<Path> stream = Files.list(dir)) {
+            return stream
+                    .filter(p -> p.getFileName().toString().endsWith(".json"))
+                    .filter(p -> {
+                        DiaryFile df = readQuietly(p);
+                        return df != null && df.orphaned && ownerUuid.toString().equals(df.ownerMaidId);
+                    })
+                    .sorted(Comparator.comparingLong((Path p) -> {
+                        DiaryFile df = readQuietly(p);
+                        return df == null ? 0L : df.updatedAt;
+                    }).reversed())
+                    .toList();
+        } catch (IOException e) {
+            DiaryMod.LOGGER.error("Failed to list orphaned diary files", e);
+            return List.of();
+        }
+    }
+
     private static DiaryFile readQuietly(Path p) {
         try {
             return GSON.fromJson(Files.readString(p, StandardCharsets.UTF_8), DiaryFile.class);
@@ -134,6 +181,18 @@ public final class DiaryStorage {
         public String ownerMaidId;
         public long createdAt;
         public long updatedAt;
+        /** true = 已有正向销毁证据（物品被摧毁/消失），内容保留、可被找回；false/缺省 = 正常。 */
+        public boolean orphaned;
+        /** 备注（AI 命名，供玩家与 AI 区分；恢复迁移时携带）。 */
+        public String note;
+        /** 上锁（AI 可控）：普通右键被拦截，潜行右键可强开；恢复迁移时携带。 */
+        public boolean locked;
+        /** 主人最近一次成功阅读的时刻（epoch ms；0 = 从未读过）。 */
+        public long ownerReadAt;
+        /** 主人最近一次阅读时读到的条目数（读到第几条）。 */
+        public int ownerReadThrough;
+        /** 最近一次阅读是否为强开（读上锁的日记）。 */
+        public boolean ownerReadForced;
         public List<Entry> entries = new ArrayList<>();
 
         public static class Entry {

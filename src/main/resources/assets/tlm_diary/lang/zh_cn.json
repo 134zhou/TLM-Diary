@@ -1,8 +1,18 @@
 {
   "item.tlm_diary.diary_book": "日记本",
   "tool.tlm_diary.write_diary_entry.summary": "正在写日记……",
+  "tool.tlm_diary.set_diary_note.summary": "正在为日记命名：%s",
+  "tool.tlm_diary.set_diary_lock.summary": "正在设置日记锁：%s",
   "tlm_diary.diary.empty": "这本日记还没有内容。",
   "tlm_diary.tooltip.bound_to": "%s 的日记本",
   "tlm_diary.tooltip.unbound": "未绑定女仆",
-  "tlm_diary.tooltip.unknown": "未知女仆"
+  "tlm_diary.tooltip.unknown": "未知女仆",
+  "tlm_diary.tooltip.note": "备注：%s",
+  "tlm_diary.tooltip.locked": "已上锁",
+  "tlm_diary.lock.blocked": "%s 把日记锁住了。潜行右键可以强行打开。",
+  "tlm_diary.notify.destroyed": "一本日记本已被销毁。用祭坛制作一本新的日记本并交给女仆，即可找回其中的内容。",
+  "tlm_diary.notify.recovered": "已把 %s 条内容找回至新的日记本。",
+  "tlm_diary.recovery.title": "选择要找回的遗失日记",
+  "tlm_diary.recovery.hint": "这位女仆有多本遗失的日记，请选择要恢复到这本新日记中的那一本。",
+  "tlm_diary.recovery.close": "关闭"
 }

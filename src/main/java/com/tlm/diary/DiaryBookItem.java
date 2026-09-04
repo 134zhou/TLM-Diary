@@ -7,6 +7,8 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResultHolder;
+import net.minecraft.world.damagesource.DamageSource;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
@@ -39,6 +41,17 @@ public class DiaryBookItem extends Item {
             // 事件驱动刷新 ownerName 回退缓存（女仆同维度已加载时）
             DiaryApi.refreshOwnerName(stack, level);
             DiaryMeta meta = DiaryApi.metaOf(stack);
+            // 上锁拦截：普通右键打不开（提示）；潜行右键 = 强开（会被记录并提示 AI）
+            if (meta.locked() && !player.isShiftKeyDown()) {
+                String maidName = meta.ownerName() == null || meta.ownerName().isBlank()
+                        ? "?"
+                        : meta.ownerName();
+                serverPlayer.sendSystemMessage(
+                        Component.translatable("tlm_diary.lock.blocked", maidName));
+                return InteractionResultHolder.sidedSuccess(stack, false);
+            }
+            // 记录"主人读过"（时间 / 读到第几条 / 是否强开），供 DiaryContext 提示 AI
+            DiaryApi.recordOwnerRead(stack);
             List<DiaryEntry> entries = DiaryApi.readEntries(stack);
             PacketDistributor.sendToPlayer(serverPlayer, new DiaryViewPayload(meta.diaryUuid(), entries));
         }
@@ -55,6 +68,16 @@ public class DiaryBookItem extends Item {
         } else {
             String name = resolveOwnerName(meta.ownerUuid().get(), meta.ownerName());
             tooltipComponents.add(Component.translatable("tlm_diary.tooltip.bound_to", name).withStyle(ChatFormatting.GRAY));
+            // 备注（AI 命名）：玩家与 AI 区分多本日记的可读标签
+            if (meta.hasNote()) {
+                tooltipComponents.add(Component.translatable("tlm_diary.tooltip.note", meta.note())
+                        .withStyle(ChatFormatting.GRAY));
+            }
+            // 上锁：普通右键被拦截，潜行右键可强开
+            if (meta.locked()) {
+                tooltipComponents.add(Component.translatable("tlm_diary.tooltip.locked")
+                        .withStyle(ChatFormatting.GRAY));
+            }
         }
         super.appendHoverText(stack, context, tooltipComponents, tooltipFlag);
     }
@@ -75,9 +98,26 @@ public class DiaryBookItem extends Item {
         return Component.translatable("tlm_diary.tooltip.unknown").getString();
     }
 
+    /**
+     * 掉落物被摧毁（岩浆/火焰/击杀/仙人掌等）→ 标记文件孤儿并尽力通知。
+     * 1 参（原版 {@code Item#onDestroyed}）与 2 参（NeoForge {@code IItemExtension} 默认方法，
+     * 经 {@code IItemStackExtension} → {@code Item.onDestroyed} 委托链，已用 javap 核实）均覆写以覆盖全部路径。
+     */
     @Override
-    public void verifyComponentsAfterLoad(ItemStack stack) {
-        // 物品从磁盘/网络反序列化后，把其 uuid 登记为"活跃日记"，供销毁检测（孤儿标记）使用。
-        DiaryApi.markAlive(stack);
+    public void onDestroyed(ItemEntity itemEntity) {
+        onDiaryDestroyed(itemEntity);
+    }
+
+    @Override
+    public void onDestroyed(ItemEntity itemEntity, DamageSource damageSource) {
+        onDiaryDestroyed(itemEntity);
+    }
+
+    private void onDiaryDestroyed(ItemEntity itemEntity) {
+        if (itemEntity.level().isClientSide()) {
+            return;
+        }
+        DiaryApi.markDestroyed(itemEntity.getItem());
+        DiaryDestructionHandler.notifyDestroyed(itemEntity);
     }
 }

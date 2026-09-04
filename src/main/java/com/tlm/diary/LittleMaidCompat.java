@@ -25,15 +25,17 @@ public class LittleMaidCompat implements ILittleMaid {
 
     @Override
     public void registerAITool(ToolRegister register) {
-        // 仅向 AI 暴露写入工具，由 AI 自主决定是否写日记。
+        // 仅向 AI 暴露工具，由 AI 自主决定：写入日记、命名/修改备注、上锁/解锁。
         register.register(new WriteDiaryEntryTool());
+        register.register(new SetDiaryNoteTool());
+        register.register(new SetDiaryLockTool());
     }
 
     @Override
     public void registerAIMaidContext(GameContextRegister register) {
         // 先注册分类，再注册上下文项（顺序不可颠倒，否则抛异常）。
         register.registerCategory("diary",
-                "Diary books the maid owns: identifiers, entry counts and remaining capacity", false);
+                "Diary books the maid owns: notes, identifiers, entry counts and remaining capacity", false);
         register.registerContext("diary", new DiaryContext());
     }
 }

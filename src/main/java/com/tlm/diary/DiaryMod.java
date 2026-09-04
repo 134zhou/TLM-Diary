@@ -6,6 +6,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.world.item.CreativeModeTabs;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.common.Mod;
+import net.neoforged.neoforge.common.NeoForge;
 import net.neoforged.neoforge.event.BuildCreativeModeTabContentsEvent;
 import net.neoforged.neoforge.network.event.RegisterPayloadHandlersEvent;
 import net.neoforged.neoforge.registries.DeferredHolder;
@@ -50,6 +51,8 @@ public class DiaryMod {
         DATA_COMPONENTS.register(modEventBus);
         modEventBus.addListener(this::addCreative);
         modEventBus.addListener(this::registerPayloads);
+        // 游戏总线：掉落物到期消失等销毁场景（恢复外部文件用）
+        NeoForge.EVENT_BUS.register(DiaryDestructionHandler.class);
     }
 
     /** 将日记本加入原版"工具与实用品"标签页（与书与笔同页）。 */
@@ -59,11 +62,19 @@ public class DiaryMod {
         }
     }
 
-    /** 注册自定义网络 payload（只读阅读界面：服务端下发日记条目）。 */
+    /** 注册自定义网络 payload：只读阅读（服务端下发日记条目）、恢复选择（≥2 孤儿时）。 */
     private void registerPayloads(RegisterPayloadHandlersEvent event) {
         event.registrar(MODID).playToClient(
                 DiaryViewPayload.TYPE,
                 DiaryViewPayload.STREAM_CODEC,
                 DiaryViewPayload::handle);
+        event.registrar(MODID).playToClient(
+                ClientboundDiaryRecoveryPayload.TYPE,
+                ClientboundDiaryRecoveryPayload.STREAM_CODEC,
+                ClientboundDiaryRecoveryPayload::handle);
+        event.registrar(MODID).playToServer(
+                ServerboundDiaryRecoverChoicePayload.TYPE,
+                ServerboundDiaryRecoverChoicePayload.STREAM_CODEC,
+                ServerboundDiaryRecoverChoicePayload::handle);
     }
 }

@@ -30,9 +30,11 @@ public class DiaryBauble implements IMaidBauble {
             file.ownerMaidId = maid.getUUID().toString();
             file.updatedAt = System.currentTimeMillis();
             DiaryStorage.save(meta.diaryUuid(), file);
+
+            // 首次绑定一本全新日记本：若该女仆有已销毁的孤儿日记，触发找回（0/1/多）。
+            DiaryApi.recoverIfOrphaned(maid, baubleItem);
         } else if (meta.isOwner(maid.getUUID())) {
             DiaryApi.refreshOwnerName(baubleItem, maid);
         }
-        DiaryApi.markAlive(baubleItem);
     }
 }

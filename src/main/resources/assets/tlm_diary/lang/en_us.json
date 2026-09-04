@@ -1,8 +1,18 @@
 {
   "item.tlm_diary.diary_book": "Diary Book",
   "tool.tlm_diary.write_diary_entry.summary": "writing in the diary...",
+  "tool.tlm_diary.set_diary_note.summary": "naming the diary: %s",
+  "tool.tlm_diary.set_diary_lock.summary": "setting diary lock: %s",
   "tlm_diary.diary.empty": "This diary is empty.",
   "tlm_diary.tooltip.bound_to": "%s's Diary",
   "tlm_diary.tooltip.unbound": "Not bound to a maid",
-  "tlm_diary.tooltip.unknown": "Unknown Maid"
+  "tlm_diary.tooltip.unknown": "Unknown Maid",
+  "tlm_diary.tooltip.note": "Note: %s",
+  "tlm_diary.tooltip.locked": "Locked",
+  "tlm_diary.lock.blocked": "%s locked this diary. Sneak + right-click to force it open.",
+  "tlm_diary.notify.destroyed": "A diary book has been destroyed. Craft a new one with the altar and give it to the maid to recover its content.",
+  "tlm_diary.notify.recovered": "Recovered %s entry/entries into the new diary book.",
+  "tlm_diary.recovery.title": "Choose a lost diary to recover",
+  "tlm_diary.recovery.hint": "The maid has several lost diaries. Pick which one to recover into this new book.",
+  "tlm_diary.recovery.close": "Close"
 }
