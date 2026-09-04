@@ -23,6 +23,11 @@ import java.util.stream.Stream;
  */
 public final class DiaryStorage {
 
+    public static final String OWNER_TYPE_MAID = "maid";
+    public static final String OWNER_TYPE_PLAYER = "player";
+    public static final String WRITER_MAID = "maid";
+    public static final String WRITER_PLAYER = "player";
+
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
 
     private DiaryStorage() {
@@ -44,12 +49,43 @@ public final class DiaryStorage {
         }
         try {
             String json = Files.readString(f, StandardCharsets.UTF_8);
-            return GSON.fromJson(json, DiaryFile.class);
+            return normalize(GSON.fromJson(json, DiaryFile.class));
         } catch (Exception e) {
             DiaryMod.LOGGER.error("Failed to read diary file {}, treating it as corrupted", f, e);
             backupCorrupted(f);
             return null;
         }
+    }
+
+    /** 兼容旧档：旧文件只有 ownerMaidId，缺省推断为女仆日记；条目缺省 writerKind/comment 也在此补齐。 */
+    private static DiaryFile normalize(DiaryFile df) {
+        if (df == null) {
+            return null;
+        }
+        if (df.ownerType == null || df.ownerType.isBlank()) {
+            if (df.ownerId == null || df.ownerId.isBlank()) {
+                df.ownerType = df.ownerMaidId == null || df.ownerMaidId.isBlank() ? "" : OWNER_TYPE_MAID;
+                df.ownerId = df.ownerMaidId;
+            } else {
+                df.ownerType = "";
+            }
+        } else if (df.ownerId == null || df.ownerId.isBlank()) {
+            if (OWNER_TYPE_MAID.equals(df.ownerType)) {
+                df.ownerId = df.ownerMaidId;
+            }
+        }
+        if (df.entries == null) {
+            df.entries = new ArrayList<>();
+        }
+        for (DiaryFile.Entry e : df.entries) {
+            if (e.writerKind == null || e.writerKind.isBlank()) {
+                e.writerKind = WRITER_MAID;
+            }
+            if (e.comments == null) {
+                e.comments = new ArrayList<>();
+            }
+        }
+        return df;
     }
 
     private static void backupCorrupted(Path f) {
@@ -98,16 +134,42 @@ public final class DiaryStorage {
 
     /** 列出某女仆名下（ownerMaidId 匹配）的全部日记文件，按 updatedAt 倒序。 */
     public static List<Path> listOwnedFiles(UUID ownerUuid) {
+        return listOwnedFiles(ownerUuid, OWNER_TYPE_MAID);
+    }
+
+    /** 列出某绑定对象（ownerId + ownerType 匹配）名下的全部日记文件，按 updatedAt 倒序。 */
+    public static List<Path> listOwnedFiles(UUID ownerUuid, String ownerType) {
+        return listFiles(ownerUuid, ownerType, false);
+    }
+
+    /** 列出某女仆名下已标记孤儿（正向销毁证据）的日记文件，按 updatedAt 倒序。 */
+    public static List<Path> listOwnedOrphaned(UUID ownerUuid) {
+        return listOwnedOrphaned(ownerUuid, OWNER_TYPE_MAID);
+    }
+
+    /** 列出某绑定对象名下已标记孤儿的日记文件，按 updatedAt 倒序。 */
+    public static List<Path> listOwnedOrphaned(UUID ownerUuid, String ownerType) {
+        return listFiles(ownerUuid, ownerType, true);
+    }
+
+    private static List<Path> listFiles(UUID ownerUuid, String ownerType, boolean orphanedOnly) {
         Path dir = diariesDir();
         if (!Files.isDirectory(dir)) {
             return List.of();
         }
+        String owner = ownerUuid == null ? null : ownerUuid.toString();
         try (Stream<Path> stream = Files.list(dir)) {
             return stream
                     .filter(p -> p.getFileName().toString().endsWith(".json"))
                     .filter(p -> {
                         DiaryFile df = readQuietly(p);
-                        return df != null && ownerUuid.toString().equals(df.ownerMaidId);
+                        if (df == null) {
+                            return false;
+                        }
+                        if (orphanedOnly && !df.orphaned) {
+                            return false;
+                        }
+                        return ownerType.equals(df.ownerType) && owner != null && owner.equals(df.ownerId);
                     })
                     .sorted(Comparator.comparingLong((Path p) -> {
                         DiaryFile df = readQuietly(p);
@@ -143,33 +205,39 @@ public final class DiaryStorage {
         }
     }
 
-    /** 列出某女仆名下已标记孤儿（正向销毁证据）的日记文件，按 updatedAt 倒序。 */
-    public static List<Path> listOwnedOrphaned(UUID ownerUuid) {
-        Path dir = diariesDir();
-        if (!Files.isDirectory(dir)) {
-            return List.of();
+    public static boolean isPlayerEntry(DiaryFile.Entry e) {
+        return e != null && WRITER_PLAYER.equals(e.writerKind);
+    }
+
+    public static int countPlayerEntries(DiaryFile file) {
+        if (file == null || file.entries == null) {
+            return 0;
         }
-        try (Stream<Path> stream = Files.list(dir)) {
-            return stream
-                    .filter(p -> p.getFileName().toString().endsWith(".json"))
-                    .filter(p -> {
-                        DiaryFile df = readQuietly(p);
-                        return df != null && df.orphaned && ownerUuid.toString().equals(df.ownerMaidId);
-                    })
-                    .sorted(Comparator.comparingLong((Path p) -> {
-                        DiaryFile df = readQuietly(p);
-                        return df == null ? 0L : df.updatedAt;
-                    }).reversed())
-                    .toList();
-        } catch (IOException e) {
-            DiaryMod.LOGGER.error("Failed to list orphaned diary files", e);
-            return List.of();
+        int count = 0;
+        for (DiaryFile.Entry e : file.entries) {
+            if (isPlayerEntry(e)) {
+                count++;
+            }
         }
+        return count;
+    }
+
+    public static int countUncommentedPlayerEntries(DiaryFile file) {
+        if (file == null || file.entries == null) {
+            return 0;
+        }
+        int count = 0;
+        for (DiaryFile.Entry e : file.entries) {
+            if (isPlayerEntry(e) && (e.comments == null || e.comments.isEmpty())) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private static DiaryFile readQuietly(Path p) {
         try {
-            return GSON.fromJson(Files.readString(p, StandardCharsets.UTF_8), DiaryFile.class);
+            return normalize(GSON.fromJson(Files.readString(p, StandardCharsets.UTF_8), DiaryFile.class));
         } catch (Exception e) {
             return null;
         }
@@ -178,14 +246,19 @@ public final class DiaryStorage {
     /** 外部文件 JSON 结构（DTO）。 */
     public static class DiaryFile {
         public String diaryId;
+        /** 旧档兼容字段：女仆日记的绑定女仆 UUID；新档也继续写，便于旧版本读取。 */
         public String ownerMaidId;
+        /** 绑定类型：maid / player；空 = 未绑定。 */
+        public String ownerType;
+        /** 绑定对象 UUID（女仆或玩家）。 */
+        public String ownerId;
         public long createdAt;
         public long updatedAt;
         /** true = 已有正向销毁证据（物品被摧毁/消失），内容保留、可被找回；false/缺省 = 正常。 */
         public boolean orphaned;
         /** 备注（AI 命名，供玩家与 AI 区分；恢复迁移时携带）。 */
         public String note;
-        /** 上锁（AI 可控）：普通右键被拦截，潜行右键可强开；恢复迁移时携带。 */
+        /** 上锁（仅女仆日记有意义）：普通右键被拦截，潜行右键可强开；恢复迁移时携带。 */
         public boolean locked;
         /** 主人最近一次成功阅读的时刻（epoch ms；0 = 从未读过）。 */
         public long ownerReadAt;
@@ -196,6 +269,16 @@ public final class DiaryStorage {
         public List<Entry> entries = new ArrayList<>();
 
         public static class Entry {
+            public long writtenAt;
+            public String author;
+            public String text;
+            /** 写入者类型：maid（缺省，女仆写）/ player（玩家写）。 */
+            public String writerKind;
+            /** 女仆在这条条目下写的评语。 */
+            public List<Comment> comments = new ArrayList<>();
+        }
+
+        public static class Comment {
             public long writtenAt;
             public String author;
             public String text;

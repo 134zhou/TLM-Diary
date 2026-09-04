@@ -63,7 +63,15 @@ public record DiaryViewPayload(UUID diaryUuid, List<DiaryEntry> entries) impleme
     private static Component page(DiaryEntry e) {
         MutableComponent header = Component.literal("[" + time(e.writtenAt()) + "] " + e.author())
                 .withStyle(ChatFormatting.GRAY);
-        return header.append("\n").append(e.text());
+        MutableComponent page = header.append("\n").append(e.text());
+        if (e.comments() != null && !e.comments().isEmpty()) {
+            for (DiaryComment c : e.comments()) {
+                MutableComponent line = Component.literal("\n  ↳ " + c.author() + ": " + c.text())
+                        .withStyle(ChatFormatting.DARK_PURPLE);
+                page = page.append(line);
+            }
+        }
+        return page;
     }
 
     private static String time(long epochMillis) {

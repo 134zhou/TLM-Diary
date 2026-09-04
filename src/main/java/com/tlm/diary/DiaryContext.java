@@ -11,9 +11,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 日记上下文项：向 AI 暴露女仆当前持有的日记本列表（备注 / 锁状态 / 短 uuid / 已写条数 / 容量），
- * 供 AI 按备注区分并自主选择写入哪一本；给出"无备注命名提醒"、"主人读过/强开阅读"提示与改名提醒。
+ * 日记上下文项：向 AI 暴露女仆当前持有的女仆日记本列表，以及主人名下的玩家日记本列表。
  * <p>
+ * 女仆日记：备注 / 锁状态 / 短 uuid / 已写条数 / 容量 / 归属标记；
+ * 玩家日记：备注 / 短 uuid / 条目数 / 未评论数（供 AI 决定是否 read_player_diary + comment_diary）。
  * 注册于按需查询分类 {@code diary}，AI 经 query_game_context 工具按需拉取，节省 token。
  */
 public class DiaryContext extends AbstractMaidContext {
@@ -27,14 +28,12 @@ public class DiaryContext extends AbstractMaidContext {
     @Override
     public String getValue(EntityMaid maid) {
         List<ItemStack> diaries = DiaryApi.findDiaries(maid);
-        if (diaries.isEmpty()) {
-            return "no diary book";
-        }
         String currentName = maid.getName().getString();
         List<String> parts = new ArrayList<>();
         List<String> unNamed = new ArrayList<>();
         List<String> readNotices = new ArrayList<>();
         String renameNotice = null;
+
         for (ItemStack d : diaries) {
             DiaryMeta m = DiaryApi.metaOf(d);
             String shortUuid = m.diaryUuid().toString().substring(0, 8);
@@ -44,11 +43,14 @@ public class DiaryContext extends AbstractMaidContext {
             if (m.locked()) {
                 entry.append(" [locked]");
             }
+            if (m.isBound() && !m.isOwnerMaid(maid.getUUID())) {
+                entry.append(" [not yours]");
+            }
             parts.add(entry.toString());
 
             DiaryStorage.DiaryFile file = DiaryStorage.load(m.diaryUuid());
             int total = file == null ? 0 : file.entries.size();
-            if (file != null && file.ownerReadAt > 0) {
+            if (file != null && file.ownerReadAt > 0 && m.isMaidBound()) {
                 String readNotice = buildReadNotice(m, file, total);
                 if (readNotice != null) {
                     readNotices.add(readNotice);
@@ -57,11 +59,30 @@ public class DiaryContext extends AbstractMaidContext {
             if (!m.hasNote()) {
                 unNamed.add(shortUuid);
             }
-            if (renameNotice == null) {
+            if (renameNotice == null && m.isMaidBound()) {
                 renameNotice = checkRename(m, file, total, currentName);
             }
         }
-        StringBuilder sb = new StringBuilder("diary books: ").append(String.join(", ", parts));
+
+        StringBuilder sb = new StringBuilder();
+        if (!parts.isEmpty()) {
+            sb.append("maid diaries: ").append(String.join(", ", parts));
+        } else {
+            sb.append("maid diaries: none");
+        }
+
+        // 主人名下的玩家日记（女仆可读并可留言）
+        List<DiaryApi.PlayerDiarySignal> playerDiaries = DiaryApi.getPlayerDiarySignals(maid);
+        if (!playerDiaries.isEmpty()) {
+            List<String> pdParts = new ArrayList<>();
+            for (DiaryApi.PlayerDiarySignal s : playerDiaries) {
+                String label = s.hasNote() ? "'" + s.note() + "'" : "<unnamed>";
+                pdParts.add(label + " " + s.shortId() + " (owner's diary, " + s.totalEntries()
+                        + " entries, " + s.uncommentedEntries() + " un-commented)");
+            }
+            sb.append(". Owner's diaries: ").append(String.join(", ", pdParts));
+        }
+
         if (!unNamed.isEmpty()) {
             sb.append(". Reminder: diaries ").append(String.join(", ", unNamed))
                     .append(" have no note yet; name them with set_diary_note when appropriate.");
@@ -75,7 +96,7 @@ public class DiaryContext extends AbstractMaidContext {
         return sb.toString();
     }
 
-    /** 主人读过该本日记的提示；无读记录返回 null。 */
+    /** 主人读过该本女仆日记的提示；无读记录返回 null。 */
     private static String buildReadNotice(DiaryMeta meta, DiaryStorage.DiaryFile file, int total) {
         String label = meta.hasNote() ? "'" + meta.note() + "'" : "<unnamed>";
         String time = TIME.format(Instant.ofEpochMilli(file.ownerReadAt).atZone(ZoneId.systemDefault()));

@@ -12,8 +12,12 @@ import net.neoforged.neoforge.items.IItemHandler;
 import net.neoforged.neoforge.network.PacketDistributor;
 
 import java.nio.file.Path;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
@@ -22,7 +26,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * 日记写读的统一入口（权限收敛到服务端）。
  * <p>
- * 权限模型：绑定女仆可读可写；其他女仆只读（写请求返回 NOT_OWNER）；玩家只读（GUI 走服务端下发，无写路径）。
+ * 权限模型：女仆日记（ownerType=maid）——绑定女仆可读可写，其他女仆只读，玩家只读；
+ * 玩家日记（ownerType=player）——玩家可读可写，其女仆可读并写评语。
  */
 public final class DiaryApi {
 
@@ -30,15 +35,34 @@ public final class DiaryApi {
     public static final int MAX_TEXT_LENGTH = 1024;
     /** 备注（AI 命名）长度上限。 */
     public static final int MAX_NOTE_LENGTH = 64;
+    public static final int MAX_AI_LIMIT = 10;
+
+    private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
 
     /** 待恢复选择的新本登记：maidUuid → 刚绑定的新日记本 uuid（≥2 本孤儿时，供选择后定位目标栈）。 */
     private static final Map<UUID, UUID> PENDING_RECOVERY = new ConcurrentHashMap<>();
+
+    /** 玩家日记"未评论"信号缓存：playerUuid → 其名下玩家日记信号（事件驱动刷新，供自动注入 Context 零文件 IO 读取）。 */
+    private static final Map<UUID, List<PlayerDiarySignal>> PLAYER_DIARY_SIGNALS = new ConcurrentHashMap<>();
 
     private DiaryApi() {
     }
 
     public enum WriteResult {
         SUCCESS, NO_DIARY_BOOK, NOT_OWNER, DIARY_FULL, STORAGE_ERROR
+    }
+
+    public record PlayerDiarySignal(UUID diaryUuid, String note, int totalEntries, int uncommentedEntries) {
+        public String shortId() {
+            return diaryUuid.toString().substring(0, 8);
+        }
+
+        public boolean hasNote() {
+            return note != null && !note.isBlank();
+        }
+    }
+
+    private record PlayerDiary(UUID uuid, DiaryStorage.DiaryFile file) {
     }
 
     /** 读取/惰性初始化某日记本的元数据。 */
@@ -57,7 +81,7 @@ public final class DiaryApi {
             return;
         }
         DiaryMeta meta = diary.get(DiaryMod.DIARY_META.get());
-        if (meta == null || !meta.isOwner(maid.getUUID())) {
+        if (meta == null || !meta.isOwnerMaid(maid.getUUID())) {
             return;
         }
         String current = maid.getName().getString();
@@ -72,7 +96,7 @@ public final class DiaryApi {
             return;
         }
         DiaryMeta meta = diary.get(DiaryMod.DIARY_META.get());
-        if (meta == null || !meta.isBound()) {
+        if (meta == null || !meta.isMaidBound()) {
             return;
         }
         Entity entity = serverLevel.getEntity(meta.ownerUuid().get());
@@ -127,10 +151,10 @@ public final class DiaryApi {
         if (uuid == null || token == null) {
             return false;
         }
-        return uuid.toString().startsWith(token.trim().toLowerCase());
+        return uuid.toString().startsWith(token.trim().toLowerCase(Locale.ROOT));
     }
 
-    /** 服务端写一条日记，返回结果枚举。 */
+    /** 服务端写一条女仆日记，返回结果枚举。 */
     public static WriteResult writeEntry(EntityMaid maid, ItemStack diary, String author, String text) {
         if (diary == null || diary.isEmpty() || !diary.is(DiaryMod.DIARY_BOOK.get())) {
             return WriteResult.NO_DIARY_BOOK;
@@ -138,12 +162,12 @@ public final class DiaryApi {
         DiaryMeta meta = metaOf(diary);
         UUID maidUuid = maid.getUUID();
 
-        if (meta.isBound() && !meta.isOwner(maidUuid)) {
+        if (meta.isBound() && !meta.isOwnerMaid(maidUuid)) {
             return WriteResult.NOT_OWNER;
         }
         // 事件驱动刷新 ownerName 回退缓存（写日记时有 maid 实体在手，零查询零轮询）
         if (!meta.isBound()) {
-            meta = meta.withOwner(maidUuid).withOwnerName(maid.getName().getString());
+            meta = meta.withOwner(maidUuid, DiaryMeta.OWNER_TYPE_MAID).withOwnerName(maid.getName().getString());
         } else {
             meta = meta.withOwnerName(maid.getName().getString());
         }
@@ -152,7 +176,7 @@ public final class DiaryApi {
         }
 
         String clean = sanitize(text);
-        DiaryEntry entry = new DiaryEntry(System.currentTimeMillis(), author, clean);
+        DiaryEntry entry = new DiaryEntry(System.currentTimeMillis(), author, clean, List.of());
 
         DiaryStorage.DiaryFile file = DiaryStorage.load(meta.diaryUuid());
         if (file == null) {
@@ -161,7 +185,9 @@ public final class DiaryApi {
             file.createdAt = System.currentTimeMillis();
         }
         file.ownerMaidId = maidUuid.toString();
-        file.entries.add(toFileEntry(entry));
+        file.ownerType = DiaryStorage.OWNER_TYPE_MAID;
+        file.ownerId = maidUuid.toString();
+        file.entries.add(toFileEntry(entry, DiaryStorage.WRITER_MAID));
         file.updatedAt = System.currentTimeMillis();
 
         if (!DiaryStorage.save(meta.diaryUuid(), file)) {
@@ -187,7 +213,7 @@ public final class DiaryApi {
         }
         List<DiaryEntry> out = new ArrayList<>();
         for (DiaryStorage.DiaryFile.Entry e : file.entries) {
-            out.add(new DiaryEntry(e.writtenAt, e.author, e.text));
+            out.add(toEntry(e));
         }
         return out;
     }
@@ -202,18 +228,22 @@ public final class DiaryApi {
             }
             return "The maid does not have a diary book. You can ask the owner to craft one and give it to you.";
         }
+        DiaryMeta meta = metaOf(diary);
+        if (meta.isPlayerBound()) {
+            return "This is the owner's diary, not your own. You cannot write your own entries here; "
+                    + "read it with read_player_diary and leave comments with comment_diary.";
+        }
         String author = maid.getName().getString();
         String text = content;
         if (emotion != null && !emotion.isBlank()) {
             text = "[" + emotion + "] " + content;
         }
         WriteResult r = writeEntry(maid, diary, author, text);
-        DiaryMeta meta = metaOf(diary);
+        meta = metaOf(diary);
         return switch (r) {
             case SUCCESS -> {
                 String base = "Diary entry written successfully (%d/%d)."
                         .formatted(meta.writtenCount(), meta.maxEntries());
-                // 无备注：主动提示 AI 命名（事件驱动信号，非轮询）
                 yield meta.hasNote() ? base
                         : base + " This diary has no note yet; consider naming it with set_diary_note.";
             }
@@ -227,7 +257,7 @@ public final class DiaryApi {
 
     /** 列出该女仆名下可恢复的孤儿（已检测到销毁）文件的 uuid，按最后更新倒序。 */
     public static List<UUID> listRestorable(EntityMaid maid) {
-        return DiaryStorage.listOwnedOrphaned(maid.getUUID()).stream()
+        return DiaryStorage.listOwnedOrphaned(maid.getUUID(), DiaryStorage.OWNER_TYPE_MAID).stream()
                 .map(DiaryApi::uuidFromFileName)
                 .filter(Objects::nonNull)
                 .toList();
@@ -265,7 +295,6 @@ public final class DiaryApi {
             }
             return;
         }
-        // ≥2：登记"正在等待玩家选择"的新本目标，并把候选列表发给女仆主人打开选择界面
         DiaryMeta meta = metaOf(newDiary);
         PENDING_RECOVERY.put(maid.getUUID(), meta.diaryUuid());
         openRecoveryScreen(maid, orphans);
@@ -331,8 +360,7 @@ public final class DiaryApi {
 
     /**
      * 把某孤儿文件的内容恢复到一本新日记本上（新 uuid、绑定当前女仆）。
-     * 恢复后容量 = 默认容量 + 已恢复条数，保证新本仍有 DEFAULT_MAX_ENTRIES 的全新写入空间，
-     * 避免"写满 → 销毁 → 重制"死循环；旧文件归档为 .archived。
+     * 恢复后容量 = 默认容量 + 已恢复条数；旧文件归档为 .archived。
      */
     public static boolean recover(EntityMaid maid, ItemStack newDiary, UUID orphanUuid) {
         DiaryStorage.DiaryFile old = DiaryStorage.load(orphanUuid);
@@ -343,11 +371,13 @@ public final class DiaryApi {
         String oldNote = old.note == null ? "" : old.note;
         DiaryMeta meta = new DiaryMeta(UUID.randomUUID(), java.util.Optional.of(maid.getUUID()),
                 maid.getName().getString(), oldNote, old.locked,
-                DEFAULT_MAX_ENTRIES + restored, restored);
+                DEFAULT_MAX_ENTRIES + restored, restored, DiaryMeta.OWNER_TYPE_MAID);
 
         DiaryStorage.DiaryFile nf = new DiaryStorage.DiaryFile();
         nf.diaryId = meta.diaryUuid().toString();
         nf.ownerMaidId = maid.getUUID().toString();
+        nf.ownerType = DiaryStorage.OWNER_TYPE_MAID;
+        nf.ownerId = maid.getUUID().toString();
         nf.createdAt = System.currentTimeMillis();
         nf.updatedAt = nf.createdAt;
         nf.note = oldNote;
@@ -361,7 +391,6 @@ public final class DiaryApi {
             return false;
         }
         DiaryStorage.archive(orphanUuid);
-        // 清理新本原 uuid 在绑定时可能创建的空文件，避免残留
         DiaryMeta currentMeta = newDiary.get(DiaryMod.DIARY_META.get());
         UUID oldUuid = currentMeta == null ? null : currentMeta.diaryUuid();
         newDiary.set(DiaryMod.DIARY_META.get(), meta);
@@ -372,31 +401,49 @@ public final class DiaryApi {
     }
 
     /**
-     * 供 AI 工具调用：设置/修改某本日记的备注（仅绑定女仆本人，AI 专属，玩家无入口）。
-     * 无备注时为"命名"；有备注时为"修改"（旧值随结果返回，便于 AI 自查是否必要）。
+     * 供 AI 工具调用：设置/修改某本日记的备注。
+     * 女仆日记仅绑定女仆本人可命名；玩家日记允许该主人女仆命名（便于区分多本）。
      */
     public static String setNoteForAi(EntityMaid maid, String note, String diaryUuid) {
         ItemStack diary = findDiary(maid, diaryUuid);
-        if (diary.isEmpty()) {
-            if (diaryUuid != null && !diaryUuid.isBlank() && !findDiaries(maid).isEmpty()) {
-                return "No diary book matches diary_uuid '" + diaryUuid
-                        + "'. Query the 'diary' context and use one of the ids listed there.";
+        if (!diary.isEmpty()) {
+            DiaryMeta meta = metaOf(diary);
+            if (!meta.isOwnerMaid(maid.getUUID())) {
+                return "This diary book is not bound to you; you can only name diaries that belong to you.";
             }
-            return "The maid does not have a diary book. Ask the owner for one and bind it first.";
+            return setNoteOnStack(maid, diary, meta, note);
         }
-        DiaryMeta meta = metaOf(diary);
-        if (!meta.isOwner(maid.getUUID())) {
-            return "This diary book is not bound to you; you can only name diaries that belong to you.";
+        // 玩家日记：文件级查找（玩家日记不一定在女仆身上）。
+        PlayerDiary pd = findPlayerDiary(maid, diaryUuid);
+        if (pd != null) {
+            String clean = sanitizeNote(note);
+            if (clean == null) {
+                return "The note must not be empty.";
+            }
+            String old = pd.file().note == null ? "" : pd.file().note;
+            pd.file().note = clean;
+            pd.file().updatedAt = System.currentTimeMillis();
+            if (!DiaryStorage.save(pd.uuid(), pd.file())) {
+                return "Failed to save the diary note due to a storage error.";
+            }
+            refreshPlayerDiarySignals(maid.getOwnerUUID());
+            String shortUuid = pd.uuid().toString().substring(0, 8);
+            return old.isBlank() ? "Note '%s' set for diary %s.".formatted(clean, shortUuid)
+                    : "Note updated from '%s' to '%s'.".formatted(old, clean);
         }
-        if (note == null || note.isBlank()) {
+        if (diaryUuid != null && !diaryUuid.isBlank() && !findPlayerDiaries(maid).isEmpty()) {
+            return "No diary book matches diary_uuid '" + diaryUuid
+                    + "'. Query the 'diary' context and use one of the ids listed there.";
+        }
+        return "The maid does not have a diary book. Ask the owner for one and bind it first.";
+    }
+
+    private static String setNoteOnStack(EntityMaid maid, ItemStack diary, DiaryMeta meta, String note) {
+        String clean = sanitizeNote(note);
+        if (clean == null) {
             return "The note must not be empty.";
         }
-        String clean = note.replaceAll("[\\p{Cntrl}]", " ").trim();
-        if (clean.length() > MAX_NOTE_LENGTH) {
-            clean = clean.substring(0, MAX_NOTE_LENGTH);
-        }
         String old = meta.note() == null ? "" : meta.note();
-        // 组件 + 外部文件双写（文件供恢复迁移时携带备注）
         DiaryStorage.DiaryFile file = DiaryStorage.load(meta.diaryUuid());
         if (file != null) {
             file.note = clean;
@@ -405,22 +452,20 @@ public final class DiaryApi {
         }
         diary.set(DiaryMod.DIARY_META.get(), meta.withNote(clean));
         String shortUuid = meta.diaryUuid().toString().substring(0, 8);
-        if (old.isBlank()) {
-            return "Note '%s' set for diary %s.".formatted(clean, shortUuid);
-        }
-        return "Note updated from '%s' to '%s'.".formatted(old, clean);
+        return old.isBlank() ? "Note '%s' set for diary %s.".formatted(clean, shortUuid)
+                : "Note updated from '%s' to '%s'.".formatted(old, clean);
     }
 
     /**
-     * 主人成功阅读某本日记后记录（事件驱动）：写入读时刻、读到条目数（=阅读时全书条目数）与是否强开。
-     * 供 DiaryContext 生成"主人读过"提示。
+     * 主人成功阅读某本**女仆日记**后记录（事件驱动）：写入读时刻、读到条目数（=阅读时全书条目数）与是否强开。
+     * 玩家日记不记录 ownerRead。
      */
     public static void recordOwnerRead(ItemStack diary) {
         if (diary == null || diary.isEmpty()) {
             return;
         }
         DiaryMeta meta = diary.get(DiaryMod.DIARY_META.get());
-        if (meta == null || !meta.isBound()) {
+        if (meta == null || !meta.isMaidBound()) {
             return;
         }
         DiaryStorage.DiaryFile file = DiaryStorage.load(meta.diaryUuid());
@@ -435,8 +480,7 @@ public final class DiaryApi {
     }
 
     /**
-     * 供 AI 工具调用：给某本日记上锁/解锁（仅绑定女仆本人，AI 专属，玩家无工具）。
-     * 上锁 = 普通右键被拦截、潜行右键可强开（强开会被记录并在上下文提示 AI）。
+     * 供 AI 工具调用：给某本女仆日记上锁/解锁（仅绑定女仆本人，玩家日记不支持）。
      */
     public static String setLockForAi(EntityMaid maid, boolean locked, String diaryUuid) {
         ItemStack diary = findDiary(maid, diaryUuid);
@@ -448,7 +492,10 @@ public final class DiaryApi {
             return "The maid does not have a diary book. Ask the owner for one and bind it first.";
         }
         DiaryMeta meta = metaOf(diary);
-        if (!meta.isOwner(maid.getUUID())) {
+        if (!meta.isMaidBound()) {
+            return "Only a maid-bound diary can be locked; the owner's diary has no lock.";
+        }
+        if (!meta.isOwnerMaid(maid.getUUID())) {
             return "This diary book is not bound to you; you can only lock diaries that belong to you.";
         }
         DiaryStorage.DiaryFile file = DiaryStorage.load(meta.diaryUuid());
@@ -464,6 +511,325 @@ public final class DiaryApi {
                     + "(a sneaking right-click would force it open, which you would be told about).".formatted(shortUuid);
         }
         return "Diary %s is now unlocked.".formatted(shortUuid);
+    }
+
+    // ---------- 玩家日记 ----------
+
+    /** 把未绑定日记本绑定给玩家（玩家日记）。 */
+    public static Component bindToPlayer(ServerPlayer player, ItemStack diary) {
+        if (diary == null || diary.isEmpty() || !diary.is(DiaryMod.DIARY_BOOK.get())) {
+            return Component.translatable("tlm_diary.bind.invalid");
+        }
+        DiaryMeta meta = metaOf(diary);
+        if (meta.isBound()) {
+            return Component.translatable("tlm_diary.bind.already_bound");
+        }
+        String name = player.getName().getString();
+        meta = meta.withOwner(player.getUUID(), DiaryMeta.OWNER_TYPE_PLAYER).withOwnerName(name);
+        diary.set(DiaryMod.DIARY_META.get(), meta);
+
+        DiaryStorage.DiaryFile file = DiaryStorage.load(meta.diaryUuid());
+        if (file == null) {
+            file = new DiaryStorage.DiaryFile();
+            file.diaryId = meta.diaryUuid().toString();
+            file.createdAt = System.currentTimeMillis();
+        }
+        file.ownerType = DiaryStorage.OWNER_TYPE_PLAYER;
+        file.ownerId = player.getUUID().toString();
+        file.ownerMaidId = null;
+        file.updatedAt = System.currentTimeMillis();
+        if (!DiaryStorage.save(meta.diaryUuid(), file)) {
+            return Component.translatable("tlm_diary.bind.error");
+        }
+        refreshPlayerDiarySignals(player.getUUID());
+        return Component.translatable("tlm_diary.bind.success", name);
+    }
+
+    /** 玩家在玩家日记里写一条条目，返回给玩家的提示 Component。 */
+    public static Component writeForPlayer(ServerPlayer player, ItemStack diary, String text) {
+        if (diary == null || diary.isEmpty() || !diary.is(DiaryMod.DIARY_BOOK.get())) {
+            return Component.translatable("tlm_diary.write.invalid");
+        }
+        DiaryMeta meta = metaOf(diary);
+        if (!meta.isBound()) {
+            return Component.translatable("tlm_diary.write.not_bound");
+        }
+        if (!meta.isPlayerBound()) {
+            return Component.translatable("tlm_diary.write.maid_diary_readonly");
+        }
+        if (meta.isFull()) {
+            return Component.translatable("tlm_diary.write.full", meta.writtenCount(), meta.maxEntries());
+        }
+        String clean = sanitize(text);
+        if (clean.isBlank()) {
+            return Component.translatable("tlm_diary.write.empty");
+        }
+
+        DiaryStorage.DiaryFile file = DiaryStorage.load(meta.diaryUuid());
+        if (file == null) {
+            file = new DiaryStorage.DiaryFile();
+            file.diaryId = meta.diaryUuid().toString();
+            file.createdAt = System.currentTimeMillis();
+        }
+        file.ownerType = DiaryStorage.OWNER_TYPE_PLAYER;
+        file.ownerId = meta.ownerUuid().get().toString();
+        file.ownerMaidId = null;
+
+        DiaryStorage.DiaryFile.Entry entry = new DiaryStorage.DiaryFile.Entry();
+        entry.writtenAt = System.currentTimeMillis();
+        entry.author = player.getName().getString();
+        entry.text = clean;
+        entry.writerKind = DiaryStorage.WRITER_PLAYER;
+        entry.comments = new ArrayList<>();
+        file.entries.add(entry);
+        file.updatedAt = System.currentTimeMillis();
+
+        if (!DiaryStorage.save(meta.diaryUuid(), file)) {
+            return Component.translatable("tlm_diary.write.error");
+        }
+        diary.set(DiaryMod.DIARY_META.get(), meta.withWrittenCount(file.entries.size()));
+        refreshPlayerDiarySignals(meta.ownerUuid().get());
+        return Component.translatable("tlm_diary.write.success", file.entries.size());
+    }
+
+    /** 列出主人名下的玩家日记 uuid，按 updatedAt 倒序。 */
+    public static List<UUID> findPlayerDiaries(EntityMaid maid) {
+        UUID owner = maid.getOwnerUUID();
+        if (owner == null) {
+            return List.of();
+        }
+        return DiaryStorage.listOwnedFiles(owner, DiaryStorage.OWNER_TYPE_PLAYER).stream()
+                .map(DiaryApi::uuidFromFileName)
+                .filter(Objects::nonNull)
+                .toList();
+    }
+
+    /** 定位主人的玩家日记：diaryUuid 为空取最近更新的一本；否则取前缀匹配的那本。 */
+    public static PlayerDiary findPlayerDiary(EntityMaid maid, String diaryUuid) {
+        List<UUID> uuids = findPlayerDiaries(maid);
+        if (uuids.isEmpty()) {
+            return null;
+        }
+        UUID target = null;
+        if (diaryUuid == null || diaryUuid.isBlank()) {
+            target = uuids.get(0);
+        } else {
+            for (UUID u : uuids) {
+                if (isUuidMatch(u, diaryUuid)) {
+                    target = u;
+                    break;
+                }
+            }
+        }
+        if (target == null) {
+            return null;
+        }
+        DiaryStorage.DiaryFile file = DiaryStorage.load(target);
+        return file == null ? null : new PlayerDiary(target, file);
+    }
+
+    /** 供 AI 读取主人玩家日记（含每条已有评语）。 */
+    public static String readPlayerDiaryForAi(EntityMaid maid, String diaryUuid, String mode,
+                                              Integer from, Integer limit, String query) {
+        PlayerDiary pd = findPlayerDiary(maid, diaryUuid);
+        if (pd == null) {
+            if (diaryUuid != null && !diaryUuid.isBlank() && !findPlayerDiaries(maid).isEmpty()) {
+                return "No owner's diary matches diary_uuid '" + diaryUuid
+                        + "'. Query the 'diary' context and use one of the ids listed there.";
+            }
+            return "The owner does not have a diary book bound to them yet.";
+        }
+        DiaryStorage.DiaryFile file = pd.file();
+        int total = file.entries.size();
+        String label = noteLabel(file.note);
+        String shortId = pd.uuid().toString().substring(0, 8);
+        if (total == 0) {
+            return "Owner's diary " + label + " " + shortId + " is empty.";
+        }
+
+        String m = mode == null || mode.isBlank() ? "latest" : mode.trim().toLowerCase(Locale.ROOT);
+        int lim = clampLimit(limit);
+        int start;
+        int end;
+        StringBuilder body = new StringBuilder();
+
+        switch (m) {
+            case "latest" -> {
+                start = Math.max(0, total - lim);
+                end = total;
+                body.append("Owner's diary ").append(label).append(' ').append(shortId)
+                        .append(", ").append(total).append(" entries (showing latest ").append(end - start).append("):\n");
+                appendEntries(body, file.entries, start, end);
+                body.append("(Showing #").append(start + 1).append("-#").append(end)
+                        .append(" of ").append(total).append(", oldest to newest.");
+                if (start > 0) {
+                    body.append(" Use read_player_diary with mode=range, from=1, limit=").append(lim)
+                            .append(" to read older entries.)");
+                } else {
+                    body.append(")");
+                }
+            }
+            case "range" -> {
+                int fromVal = from == null ? 1 : Math.max(1, from);
+                if (fromVal > total) {
+                    return "No entries in that range. Owner's diary " + label + " " + shortId
+                            + " has " + total + " entries.";
+                }
+                start = fromVal - 1;
+                end = Math.min(total, start + lim);
+                body.append("Owner's diary ").append(label).append(' ').append(shortId)
+                        .append(", ").append(total).append(" entries (showing #").append(start + 1)
+                        .append("-#").append(end).append("):\n");
+                appendEntries(body, file.entries, start, end);
+                if (end < total) {
+                    body.append("(Use read_player_diary with mode=range, from=").append(end + 1)
+                            .append(", limit=").append(lim).append(" to continue.)");
+                }
+            }
+            case "search" -> {
+                if (query == null || query.isBlank()) {
+                    return "mode=search requires a non-empty query.";
+                }
+                String q = query.toLowerCase(Locale.ROOT);
+                List<Integer> hits = new ArrayList<>();
+                for (int i = 0; i < total; i++) {
+                    DiaryStorage.DiaryFile.Entry e = file.entries.get(i);
+                    if ((e.text != null && e.text.toLowerCase(Locale.ROOT).contains(q))
+                            || (e.author != null && e.author.toLowerCase(Locale.ROOT).contains(q))) {
+                        hits.add(i);
+                    }
+                }
+                if (hits.isEmpty()) {
+                    return "No entries matched '" + query + "' in owner's diary " + label + " " + shortId + ".";
+                }
+                body.append("Owner's diary ").append(label).append(' ').append(shortId)
+                        .append(", ").append(hits.size()).append(" match(es) for \"").append(query).append("\":\n");
+                int fromHit = Math.max(0, hits.size() - lim);
+                int count = 0;
+                for (int i = fromHit; i < hits.size(); i++) {
+                    int idx = hits.get(i);
+                    appendEntry(body, file.entries.get(idx), idx);
+                    count++;
+                }
+                if (fromHit > 0) {
+                    body.append("(Showing the ").append(count).append(" most recent match(es); ")
+                            .append(fromHit).append(" older match(es) not shown. Narrow the query to see specific ones.)");
+                }
+            }
+            default -> {
+                return "Unknown mode '" + mode + "'. Use one of: latest, range, search.";
+            }
+        }
+        return body.toString();
+    }
+
+    private static void appendEntries(StringBuilder body, List<DiaryStorage.DiaryFile.Entry> entries, int start, int end) {
+        for (int i = start; i < end; i++) {
+            appendEntry(body, entries.get(i), i);
+        }
+    }
+
+    private static void appendEntry(StringBuilder body, DiaryStorage.DiaryFile.Entry e, int index) {
+        body.append('#').append(index + 1).append(" [").append(time(e.writtenAt)).append("] ")
+                .append(e.author == null ? "?" : e.author).append(": ").append(e.text == null ? "" : e.text).append('\n');
+        if (e.comments != null) {
+            for (DiaryStorage.DiaryFile.Comment c : e.comments) {
+                body.append("    - comment [").append(time(c.writtenAt)).append("] ")
+                        .append(c.author == null ? "?" : c.author).append(": ").append(c.text == null ? "" : c.text).append('\n');
+            }
+        }
+    }
+
+    /** 供 AI 在主人玩家日记的某条条目下写评语。 */
+    public static String commentForAi(EntityMaid maid, String diaryUuid, Integer entryNumber, String content) {
+        PlayerDiary pd = findPlayerDiary(maid, diaryUuid);
+        if (pd == null) {
+            if (diaryUuid != null && !diaryUuid.isBlank() && !findPlayerDiaries(maid).isEmpty()) {
+                return "No owner's diary matches diary_uuid '" + diaryUuid
+                        + "'. Query the 'diary' context and use one of the ids listed there.";
+            }
+            return "The owner does not have a diary book bound to them yet.";
+        }
+        int total = pd.file().entries.size();
+        if (entryNumber == null || entryNumber < 1 || entryNumber > total) {
+            return "Entry #" + entryNumber + " does not exist. The owner's diary has " + total + " entries.";
+        }
+        String clean = sanitize(content);
+        if (clean.isBlank()) {
+            return "The comment must not be empty.";
+        }
+        DiaryStorage.DiaryFile.Entry e = pd.file().entries.get(entryNumber - 1);
+        if (e.comments == null) {
+            e.comments = new ArrayList<>();
+        }
+        DiaryStorage.DiaryFile.Comment c = new DiaryStorage.DiaryFile.Comment();
+        c.writtenAt = System.currentTimeMillis();
+        c.author = maid.getName().getString();
+        c.text = clean;
+        e.comments.add(c);
+        pd.file().updatedAt = System.currentTimeMillis();
+        if (!DiaryStorage.save(pd.uuid(), pd.file())) {
+            return "Failed to save the comment due to a storage error.";
+        }
+        refreshPlayerDiarySignals(maid.getOwnerUUID());
+        return "Comment added under entry #" + entryNumber + " of owner's diary "
+                + noteLabel(pd.file().note) + " " + pd.uuid().toString().substring(0, 8) + ".";
+    }
+
+    // ---------- 玩家日记信号 ----------
+
+    public static List<PlayerDiarySignal> getPlayerDiarySignals(EntityMaid maid) {
+        UUID owner = maid.getOwnerUUID();
+        if (owner == null) {
+            return List.of();
+        }
+        List<PlayerDiarySignal> cached = PLAYER_DIARY_SIGNALS.get(owner);
+        if (cached == null) {
+            cached = computePlayerDiarySignals(owner);
+            PLAYER_DIARY_SIGNALS.put(owner, cached);
+        }
+        return cached;
+    }
+
+    public static void refreshPlayerDiarySignals(UUID playerUuid) {
+        if (playerUuid == null) {
+            return;
+        }
+        PLAYER_DIARY_SIGNALS.put(playerUuid, computePlayerDiarySignals(playerUuid));
+    }
+
+    private static List<PlayerDiarySignal> computePlayerDiarySignals(UUID owner) {
+        List<PlayerDiarySignal> out = new ArrayList<>();
+        for (Path p : DiaryStorage.listOwnedFiles(owner, DiaryStorage.OWNER_TYPE_PLAYER)) {
+            UUID uuid = uuidFromFileName(p);
+            if (uuid == null) {
+                continue;
+            }
+            DiaryStorage.DiaryFile file = DiaryStorage.load(uuid);
+            if (file == null) {
+                continue;
+            }
+            out.add(new PlayerDiarySignal(uuid, file.note, file.entries.size(),
+                    DiaryStorage.countUncommentedPlayerEntries(file)));
+        }
+        return out;
+    }
+
+    // ---------- 工具方法 ----------
+
+    private static String noteLabel(String note) {
+        return note == null || note.isBlank() ? "<unnamed>" : "'" + note + "'";
+    }
+
+    private static int clampLimit(Integer limit) {
+        if (limit == null) {
+            return 5;
+        }
+        return Math.max(1, Math.min(MAX_AI_LIMIT, limit));
+    }
+
+    private static String time(long epochMillis) {
+        return TIME.format(Instant.ofEpochMilli(epochMillis).atZone(ZoneId.systemDefault()));
     }
 
     private static UUID uuidFromFileName(Path p) {
@@ -489,11 +855,34 @@ public final class DiaryApi {
         return t;
     }
 
-    private static DiaryStorage.DiaryFile.Entry toFileEntry(DiaryEntry e) {
+    private static String sanitizeNote(String note) {
+        if (note == null || note.isBlank()) {
+            return null;
+        }
+        String clean = note.replaceAll("[\\p{Cntrl}]", " ").trim();
+        if (clean.length() > MAX_NOTE_LENGTH) {
+            clean = clean.substring(0, MAX_NOTE_LENGTH);
+        }
+        return clean.isBlank() ? null : clean;
+    }
+
+    private static DiaryStorage.DiaryFile.Entry toFileEntry(DiaryEntry e, String writerKind) {
         DiaryStorage.DiaryFile.Entry f = new DiaryStorage.DiaryFile.Entry();
         f.writtenAt = e.writtenAt();
         f.author = e.author();
         f.text = e.text();
+        f.writerKind = writerKind;
+        f.comments = new ArrayList<>();
         return f;
+    }
+
+    private static DiaryEntry toEntry(DiaryStorage.DiaryFile.Entry e) {
+        List<DiaryComment> comments = new ArrayList<>();
+        if (e.comments != null) {
+            for (DiaryStorage.DiaryFile.Comment c : e.comments) {
+                comments.add(new DiaryComment(c.writtenAt, c.author, c.text));
+            }
+        }
+        return new DiaryEntry(e.writtenAt, e.author, e.text, comments);
     }
 }

@@ -17,7 +17,8 @@ public class DiaryBauble implements IMaidBauble {
         // 已绑定且是本人佩戴时，事件驱动刷新 ownerName 回退缓存（女仆即参数，零查询零轮询）。
         DiaryMeta meta = DiaryApi.metaOf(baubleItem);
         if (!meta.isBound()) {
-            DiaryMeta bound = meta.withOwner(maid.getUUID()).withOwnerName(maid.getName().getString());
+            DiaryMeta bound = meta.withOwner(maid.getUUID(), DiaryMeta.OWNER_TYPE_MAID)
+                    .withOwnerName(maid.getName().getString());
             baubleItem.set(DiaryMod.DIARY_META.get(), bound);
 
             // owner 同步持久化到外部文件，保证跨存档可追溯。
@@ -28,12 +29,14 @@ public class DiaryBauble implements IMaidBauble {
                 file.createdAt = System.currentTimeMillis();
             }
             file.ownerMaidId = maid.getUUID().toString();
+            file.ownerType = DiaryStorage.OWNER_TYPE_MAID;
+            file.ownerId = maid.getUUID().toString();
             file.updatedAt = System.currentTimeMillis();
             DiaryStorage.save(meta.diaryUuid(), file);
 
             // 首次绑定一本全新日记本：若该女仆有已销毁的孤儿日记，触发找回（0/1/多）。
             DiaryApi.recoverIfOrphaned(maid, baubleItem);
-        } else if (meta.isOwner(maid.getUUID())) {
+        } else if (meta.isOwnerMaid(maid.getUUID())) {
             DiaryApi.refreshOwnerName(baubleItem, maid);
         }
     }

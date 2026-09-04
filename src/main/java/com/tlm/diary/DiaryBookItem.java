@@ -35,13 +35,37 @@ public class DiaryBookItem extends Item {
     @Override
     public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
         ItemStack stack = player.getItemInHand(hand);
-        // 服务端：读外部文件，把条目下发到客户端，客户端据此打开只读 BookViewScreen。
-        // 玩家无任何编辑入口；正文仅存在于 payload 内存中，客户端 ItemStack 上不含正文。
-        if (!level.isClientSide() && player instanceof ServerPlayer serverPlayer) {
-            // 事件驱动刷新 ownerName 回退缓存（女仆同维度已加载时）
+        boolean writeMode = isQuillInOtherHand(player, hand);
+
+        if (level.isClientSide()) {
+            // 客户端：日记 + 羽毛笔 → 打开写屏；否则等待服务端下发的只读书页。
+            if (writeMode) {
+                DiaryWriteScreen.tryOpen(player, stack);
+            }
+            return InteractionResultHolder.sidedSuccess(stack, true);
+        }
+
+        if (!(player instanceof ServerPlayer serverPlayer)) {
+            return InteractionResultHolder.sidedSuccess(stack, false);
+        }
+
+        DiaryMeta meta = DiaryApi.metaOf(stack);
+
+        // 未绑定 + 潜行 → 绑定给当前玩家（玩家日记）
+        if (!meta.isBound() && player.isShiftKeyDown()) {
+            Component result = DiaryApi.bindToPlayer(serverPlayer, stack);
+            serverPlayer.sendSystemMessage(result);
+            return InteractionResultHolder.sidedSuccess(stack, false);
+        }
+
+        // 写模式：真正写入在 ServerboundDiaryWritePayload 的服务端 handler 完成
+        if (writeMode) {
+            return InteractionResultHolder.sidedSuccess(stack, false);
+        }
+
+        // 只读阅读：女仆日记保留锁/强开/主人读过语义；玩家日记直接读。
+        if (meta.isMaidBound()) {
             DiaryApi.refreshOwnerName(stack, level);
-            DiaryMeta meta = DiaryApi.metaOf(stack);
-            // 上锁拦截：普通右键打不开（提示）；潜行右键 = 强开（会被记录并提示 AI）
             if (meta.locked() && !player.isShiftKeyDown()) {
                 String maidName = meta.ownerName() == null || meta.ownerName().isBlank()
                         ? "?"
@@ -50,12 +74,18 @@ public class DiaryBookItem extends Item {
                         Component.translatable("tlm_diary.lock.blocked", maidName));
                 return InteractionResultHolder.sidedSuccess(stack, false);
             }
-            // 记录"主人读过"（时间 / 读到第几条 / 是否强开），供 DiaryContext 提示 AI
             DiaryApi.recordOwnerRead(stack);
-            List<DiaryEntry> entries = DiaryApi.readEntries(stack);
-            PacketDistributor.sendToPlayer(serverPlayer, new DiaryViewPayload(meta.diaryUuid(), entries));
         }
-        return InteractionResultHolder.sidedSuccess(stack, level.isClientSide());
+
+        List<DiaryEntry> entries = DiaryApi.readEntries(stack);
+        PacketDistributor.sendToPlayer(serverPlayer, new DiaryViewPayload(meta.diaryUuid(), entries));
+        return InteractionResultHolder.sidedSuccess(stack, false);
+    }
+
+    private static boolean isQuillInOtherHand(Player player, InteractionHand hand) {
+        ItemStack other = player.getItemInHand(hand == InteractionHand.MAIN_HAND
+                ? InteractionHand.OFF_HAND : InteractionHand.MAIN_HAND);
+        return other.is(DiaryMod.QUILL.get());
     }
 
     @Override
@@ -65,15 +95,18 @@ public class DiaryBookItem extends Item {
         DiaryMeta meta = stack.get(DiaryMod.DIARY_META.get());
         if (meta == null || !meta.isBound()) {
             tooltipComponents.add(Component.translatable("tlm_diary.tooltip.unbound").withStyle(ChatFormatting.GRAY));
+            tooltipComponents.add(Component.translatable("tlm_diary.tooltip.bind_hint").withStyle(ChatFormatting.DARK_GRAY));
         } else {
             String name = resolveOwnerName(meta.ownerUuid().get(), meta.ownerName());
             tooltipComponents.add(Component.translatable("tlm_diary.tooltip.bound_to", name).withStyle(ChatFormatting.GRAY));
-            // 备注（AI 命名）：玩家与 AI 区分多本日记的可读标签
             if (meta.hasNote()) {
                 tooltipComponents.add(Component.translatable("tlm_diary.tooltip.note", meta.note())
                         .withStyle(ChatFormatting.GRAY));
             }
-            // 上锁：普通右键被拦截，潜行右键可强开
+            if (meta.isPlayerBound()) {
+                tooltipComponents.add(Component.translatable("tlm_diary.tooltip.write_hint")
+                        .withStyle(ChatFormatting.DARK_GRAY));
+            }
             if (meta.locked()) {
                 tooltipComponents.add(Component.translatable("tlm_diary.tooltip.locked")
                         .withStyle(ChatFormatting.GRAY));

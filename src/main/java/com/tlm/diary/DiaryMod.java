@@ -34,6 +34,10 @@ public class DiaryMod {
     public static final DeferredItem<DiaryBookItem> DIARY_BOOK =
             ITEMS.register("diary_book", DiaryBookItem::new);
 
+    /** 羽毛笔 {@code tlm_diary:quill}，玩家日记的写入工具。 */
+    public static final DeferredItem<QuillItem> QUILL =
+            ITEMS.register("quill", QuillItem::new);
+
     /**
      * 日记本元数据组件（仅存索引与绑定信息：uuid / owner / ownerName 缓存 / 上限 / 已写条数）。
      * 内容不进入组件，主存储为游戏目录外部文件（见 {@link DiaryStorage}）。
@@ -51,14 +55,16 @@ public class DiaryMod {
         DATA_COMPONENTS.register(modEventBus);
         modEventBus.addListener(this::addCreative);
         modEventBus.addListener(this::registerPayloads);
-        // 游戏总线：掉落物到期消失等销毁场景（恢复外部文件用）
+        // 游戏总线：掉落物到期消失等销毁场景（恢复外部文件用）；玩家登录刷新日记信号。
         NeoForge.EVENT_BUS.register(DiaryDestructionHandler.class);
+        NeoForge.EVENT_BUS.register(DiaryLoginHandler.class);
     }
 
-    /** 将日记本加入原版"工具与实用品"标签页（与书与笔同页）。 */
+    /** 将日记本与羽毛笔加入原版"工具与实用品"标签页（与书与笔同页）。 */
     private void addCreative(BuildCreativeModeTabContentsEvent event) {
         if (event.getTabKey() == CreativeModeTabs.TOOLS_AND_UTILITIES) {
             event.accept(DIARY_BOOK.get());
+            event.accept(QUILL.get());
         }
     }
 
@@ -76,5 +82,9 @@ public class DiaryMod {
                 ServerboundDiaryRecoverChoicePayload.TYPE,
                 ServerboundDiaryRecoverChoicePayload.STREAM_CODEC,
                 ServerboundDiaryRecoverChoicePayload::handle);
+        event.registrar(MODID).playToServer(
+                ServerboundDiaryWritePayload.TYPE,
+                ServerboundDiaryWritePayload.STREAM_CODEC,
+                ServerboundDiaryWritePayload::handle);
     }
 }
